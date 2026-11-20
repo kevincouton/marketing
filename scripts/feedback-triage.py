@@ -5,13 +5,15 @@ Reads new (untriaged) submissions from the feedback service SQLite DB
 (read-only), classifies them, auto-files confident bugs as GitHub issues,
 and stages author reply drafts into the Kevin-approval queue.
 
-Contract with the w2 feedback service (Rust, SQLite): a table named
-`submissions` with at least:
+Contract with the w8 feedback service (Rust, SQLite,
+https://github.com/kevincouton/feedback): a table named `feedback` with at
+least:
     id TEXT PRIMARY KEY
     product TEXT          -- gittrend | delphi | ... (may be NULL)
-    source TEXT           -- where the submission came from
-    author TEXT           -- email/handle (may be NULL)
-    content TEXT NOT NULL
+    page TEXT             -- URL path the widget was on (the "source")
+    message TEXT NOT NULL
+    email TEXT            -- optional; reply contact for this submission only
+    status TEXT           -- received | in_review | planned | resolved
     created_at TEXT
 Triage writes back (same table): classification, sentiment, confidence,
 triaged_at, github_issue_url, theme. The service may add columns freely.
@@ -160,13 +162,13 @@ def file_bug(sub, repo: str) -> str | None:
     except json.JSONDecodeError:
         pass
 
-    title = f"[feedback] {sub['content'].strip().splitlines()[0][:70]}"
-    body = f"""Submitted via: {sub.get('source') or 'unknown'}
-Author: {sub.get('author') or 'anonymous'}
+    title = f"[feedback] {sub['message'].strip().splitlines()[0][:70]}"
+    body = f"""Submitted via: {sub.get('page') or 'widget'}
+Author: {sub.get('email') or 'anonymous'}
 Submitted at: {sub.get('created_at') or 'unknown'}
 Submission id: {marker}
 
-> {sub['content'].strip()}
+> {sub['message'].strip()}
 
 ---
 Auto-filed by the feedback triage pass (classification: bug, confidence {sub.get('confidence')}).
@@ -195,22 +197,22 @@ def main():
         ("triaged_at", "TEXT"), ("github_issue_url", "TEXT"), ("theme", "TEXT"),
     ]:
         try:
-            cur.execute(f"ALTER TABLE submissions ADD COLUMN {col} {decl}")
+            cur.execute(f"ALTER TABLE feedback ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
     con.commit()
 
     if not digest_mode:
         rows = cur.execute(
-            "SELECT * FROM submissions WHERE classification IS NULL"
+            "SELECT * FROM feedback WHERE classification IS NULL"
         ).fetchall()
         filed, drafted = 0, 0
         for row in rows:
             sub = dict(row)
             klass, sentiment, conf, product, why = classify(
-                sub["content"], sub.get("product"))
+                sub["message"], sub.get("product"))
             print(f"[{klass} {conf}] ({product or '?'}/{sentiment}) {why}: "
-                  f"{sub['content'][:80]!r}")
+                  f"{sub['message'][:80]!r}")
             if DRY_RUN:
                 continue
             issue_url = None
@@ -223,15 +225,15 @@ def main():
             # reply drafts for everything except spam go to Kevin's queue
             if klass != "spam":
                 os.makedirs(QUEUE_DIR, exist_ok=True)
-                slug = re.sub(r"[^a-z0-9]+", "-", sub["content"][:40].lower()).strip("-")
+                slug = re.sub(r"[^a-z0-9]+", "-", sub["message"][:40].lower()).strip("-")
                 with open(os.path.join(QUEUE_DIR, f"pending-{sub['id'][:8]}-{slug}.md"), "w") as f:
                     f.write(f"<!-- Kevin approves before anything is sent. "
                             f"Classification: {klass}/{sentiment} (conf {conf}). -->\n\n")
                 drafted += 1
-            theme = theme_of(sub["content"]) if klass == "feature" else None
+            theme = theme_of(sub["message"]) if klass == "feature" else None
             try:
                 cur.execute(
-                    "UPDATE submissions SET classification=?, sentiment=?, confidence=?, "
+                    "UPDATE feedback SET classification=?, sentiment=?, confidence=?, "
                     "product=COALESCE(product, ?), triaged_at=?, github_issue_url=?, theme=? WHERE id=?",
                     (klass, sentiment, conf, product,
                      datetime.datetime.now(datetime.timezone.utc).isoformat(), issue_url, theme, sub["id"]))
@@ -244,16 +246,16 @@ def main():
     # ---- weekly digest ----
     since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()
     week = cur.execute(
-        "SELECT classification, count(*) FROM submissions WHERE triaged_at >= ? GROUP BY 1",
+        "SELECT classification, count(*) FROM feedback WHERE triaged_at >= ? GROUP BY 1",
         (since,)).fetchall()
     themes_rows = cur.execute(
-        "SELECT theme, count(*) c FROM submissions WHERE classification='feature' "
+        "SELECT theme, count(*) c FROM feedback WHERE classification='feature' "
         "AND triaged_at >= ? GROUP BY theme ORDER BY c DESC LIMIT 10", (since,)).fetchall()
     bugs = cur.execute(
-        "SELECT product, content, github_issue_url FROM submissions "
+        "SELECT product, message, github_issue_url FROM feedback "
         "WHERE classification='bug' AND triaged_at >= ? ORDER BY triaged_at", (since,)).fetchall()
     praise = cur.execute(
-        "SELECT content FROM submissions WHERE classification='praise' "
+        "SELECT message FROM feedback WHERE classification='praise' "
         "AND triaged_at >= ? ORDER BY triaged_at LIMIT 5", (since,)).fetchall()
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -270,10 +272,10 @@ def main():
         f.write("\n## Bugs auto-filed\n\n")
         for b in bugs:
             link = b["github_issue_url"] or "(not filed — low confidence or unmapped product)"
-            f.write(f"- [{b['product'] or '?'}] {b['content'][:100]} → {link}\n")
+            f.write(f"- [{b['product'] or '?'}] {b['message'][:100]} → {link}\n")
         f.write("\n## Praise highlights\n\n")
         for p in praise:
-            f.write(f"> {p['content'][:200]}\n\n")
+            f.write(f"> {p['message'][:200]}\n\n")
         f.write("\n## Fixed from prior feedback\n\n")
         f.write("_Cross-reference closed issues labeled `feedback` since the last "
                  "digest — fill in from `gh issue list --repo ... --label feedback --state closed`._\n")
